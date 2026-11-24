@@ -95,7 +95,14 @@ def _catgt_root(run, config):
 def _catgt_sync_root(run, config):
     # Like _catgt_root but never returns catgt_local — sync .txt files are not
     # copied there, only the .bin and .meta files are.
+    # catgt_write is checked first: CatGT always writes its sync .txt files
+    # there, while catgt_read may hold an older copy of the run folder without
+    # them (e.g. only the .meta / ks4 output synced back to shared storage).
     run_str = f"{run['name']}_g{run['gate']}"
+    for root in (config['catgt_write'], config['catgt_read']):
+        run_dir = Path(root) / f"catgt_{run_str}"
+        if run_dir.exists() and any(run_dir.glob('*.txt')):
+            return Path(root)
     if (Path(config['catgt_read']) / f"catgt_{run_str}").exists():
         return Path(config['catgt_read'])
     return Path(config['catgt_write'])

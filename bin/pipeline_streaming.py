@@ -6,10 +6,14 @@ curation for all runs, ...), each run goes through every stage before moving on:
   download -> sorting (pipeline_ks4) -> curation -> report -> sync_outputs
            -> upload remaining local files to scratch -> verify -> delete local copy
 
-While run N is being processed, run N+1 is prepared in a background thread:
-download_raw_data.py fetches it to npx_directory if needed (legacy servers),
-then prefetch_raw copies it to raw_local. So at most two runs are on
-local disk at any time.
+While run N is being processed (sorting, curation, report), two things happen
+in background threads:
+  * run N+1 is prepared: download_raw_data.py fetches it to npx_directory if
+    needed (legacy servers), then prefetch_raw copies it to raw_local.
+  * run N-1 is uploaded: sync_outputs.py, then the upload/verify/delete below.
+    Only one upload runs at a time; if it is still going when run N is done,
+    the pipeline waits for it before starting the upload of run N.
+So at most three runs are (partly) on local disk at any time.
 
 A run's local files (raw_local copy, CatGT output in catgt_write/catgt_local,
 KS4/analyzer/report output in output_dir) are deleted ONLY when:
@@ -41,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -152,12 +157,18 @@ def local_run_dirs(run, config):
 
 def upload_dir(local_dir, dest_dir, exclude_bins):
     dest_dir.mkdir(parents=True, exist_ok=True)
-    cmd = ['rsync', '-rt', '--info=progress2']
+    # No progress output: this runs in the background next to the next run's log.
+    cmd = ['rsync', '-rt']
     if exclude_bins:
         cmd += ['--exclude=*.bin']
     cmd += [f"{local_dir}/", f"{dest_dir}/"]
-    print(f"  [Upload] {local_dir} -> {dest_dir}" + (" (without *.bin)" if exclude_bins else ""))
+    size = sum(f.stat().st_size for f in local_dir.rglob('*')
+               if f.is_file() and not (exclude_bins and f.suffix == '.bin'))
+    print(f"  [{_ts()}] [Upload] {local_dir} -> {dest_dir} ({size/1e9:.1f} GB"
+          + (", without *.bin)" if exclude_bins else ")"), flush=True)
+    t0 = time.time()
     subprocess.run(cmd, check=True)
+    print(f"  [{_ts()}] [Upload] Done {local_dir.name} in {(time.time() - t0)/60:.1f} min.", flush=True)
 
 
 def verify_dir(local_dir, dest_dir, exclude_bins):
@@ -198,29 +209,44 @@ def upload_and_cleanup(run, config):
 
 # --- Main loop ---
 
-def process_one(run, config, cfg_dir):
-    """Run all stages for one run. Returns None on success, else a failure reason."""
-    cfg_path = write_run_config(config, run, cfg_dir)
+def process_one(run, config, cfg_path):
+    """Sorting, curation and report for one run (foreground).
+    Returns (failures, sorted_ok): list of failed stage names, and whether
+    sorting succeeded (if not, there is nothing to upload)."""
     sort_env = config.get('sorting_env', 'si_ks4')
     cur_env = config.get('curation_env', 'curation')
 
     if run_stage('pipeline_ks4.py', sort_env, cfg_path) != 0:
-        return 'sorting failed'
+        return ['sorting'], False
     failures = []
     if run_stage('pipeline_curation.py', cur_env, cfg_path) != 0:
         failures.append('curation')
     if run_stage('pipeline_report.py', sort_env, cfg_path) != 0:
         failures.append('report')
-    if run_stage('sync_outputs.py', sort_env, cfg_path) != 0:
+    return failures, True
+
+
+def upload_one(run, config, cfg_path, failures, results):
+    """Background: sync_outputs, then upload + verify + delete local copy.
+    Writes None (success) or a failure reason to results[run_str]."""
+    run_str = _run_str(run)
+    results[run_str] = "upload crashed, local files kept"  # overwritten below
+    print(f"\n[{_ts()}] [Upload] Starting background upload of {run_str}", flush=True)
+    failures = list(failures)
+    if run_stage('sync_outputs.py', config.get('sorting_env', 'si_ks4'), cfg_path) != 0:
         failures.append('sync_outputs')
     if failures:
-        return f"{', '.join(failures)} failed, local files kept"
-
+        results[run_str] = f"{', '.join(failures)} failed, local files kept"
+        print(f"[{_ts()}] [Upload] {run_str}: {results[run_str]}", flush=True)
+        return
     try:
         upload_and_cleanup(run, config)
     except Exception as e:
-        return f"upload/verify failed ({e!r}), local files kept"
-    return None
+        results[run_str] = f"upload/verify failed ({e!r}), local files kept"
+        print(f"[{_ts()}] [Upload] {run_str}: {results[run_str]}", flush=True)
+        return
+    results[run_str] = None
+    print(f"[{_ts()}] [Upload] {run_str} uploaded, verified and removed locally.", flush=True)
 
 
 def main():
@@ -242,7 +268,10 @@ def main():
     except BaseException as e:
         print(f"[Download] {_run_str(runs[0])} failed: {e!r}")
 
-    pending = None
+    pending = None    # background download/prefetch of the next run
+    uploading = None  # background upload of the previous run (at most one at a time)
+    upload_results = {}
+
     for i, run in enumerate(runs):
         if pending is not None:
             if pending.is_alive():
@@ -255,12 +284,29 @@ def main():
             pending.start()
 
         print(f"\n{'#'*60}\n[{_ts()}] [Streaming] Run {i+1}/{len(runs)}: {_run_str(run)}\n{'#'*60}", flush=True)
-        reason = process_one(run, config, cfg_dir)
+        cfg_path = write_run_config(config, run, cfg_dir)
+        failures, sorted_ok = process_one(run, config, cfg_path)
+        if not sorted_ok:
+            print(f"[{_ts()}] [Streaming] {_run_str(run)}: sorting failed, local files kept, nothing uploaded.")
+            failed.append((_run_str(run), 'sorting failed'))
+            continue
+
+        # Upload this run in the background while the next run is processed.
+        if uploading is not None and uploading.is_alive():
+            print(f"\n[{_ts()}] [Streaming] Waiting for the previous upload to finish...", flush=True)
+        if uploading is not None:
+            uploading.join()
+        uploading = threading.Thread(
+            target=upload_one, args=(run, config, cfg_path, failures, upload_results), daemon=False)
+        uploading.start()
+
+    if uploading is not None:
+        if uploading.is_alive():
+            print(f"\n[{_ts()}] [Streaming] Waiting for the last upload to finish...", flush=True)
+        uploading.join()
+    for name, reason in upload_results.items():
         if reason:
-            print(f"[{_ts()}] [Streaming] {_run_str(run)}: {reason}")
-            failed.append((_run_str(run), reason))
-        else:
-            print(f"[{_ts()}] [Streaming] {_run_str(run)} done, uploaded and cleaned up.")
+            failed.append((name, reason))
 
     if failed:
         print(f"\n[{_ts()}] Runs that did not complete (local data kept):")
